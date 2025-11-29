@@ -1,0 +1,535 @@
+diff --git a/dlls/mmdevapi/Makefile.in b/dlls/mmdevapi/Makefile.in
+index 90c2302ef50..cfdde576e39 100644
+--- a/dlls/mmdevapi/Makefile.in
++++ b/dlls/mmdevapi/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = mmdevapi.dll
+-IMPORTS   = ole32 oleaut32 user32 advapi32 version
++IMPORTS   = ole32 oleaut32 user32 advapi32 version setupapi
+ 
+ SOURCES = \
+ 	audiosessionmanager.c \
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 7d56715f62d..77b6220038b 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -36,6 +36,8 @@
+ #include "endpointvolume.h"
+ #include "audiopolicy.h"
+ #include "spatialaudioclient.h"
++#include "setupapi.h"
++#include "cfgmgr32.h"
+ 
+ #include "mmdevapi_private.h"
+ #include "devpkey.h"
+@@ -511,6 +513,17 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+     MMDevice *device, *cur = NULL;
+     WCHAR guidstr[39];
+ 
++    HDEVINFO device_set;
++    WCHAR device_name[MAX_DEVICE_ID_LEN];
++    SP_DEVINFO_DATA device_info_data;
++    SP_DEVICE_INTERFACE_DATA device_interface_data;
++
++#define DEVICE_INTERFACE_DETAIL_SIZE (sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + (MAX_DEVICE_ID_LEN + 1) * sizeof(WCHAR))
++    char device_interface_detail_buffer[DEVICE_INTERFACE_DETAIL_SIZE];
++    PSP_DEVICE_INTERFACE_DETAIL_DATA_W device_interface_detail = (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)device_interface_detail_buffer;
++
++    static const GUID AudioEndpoint_ClassGUID = { 0xc166523c, 0xfe0c, 0x4a94, { 0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e } };
++
+     static const PROPERTYKEY deviceinterface_key = {
+         {0x233164c8, 0x1b2c, 0x4c7d, {0xbc, 0x68, 0xb6, 0x71, 0x68, 0x7a, 0x25, 0x67}}, 1
+     };
+@@ -614,6 +627,57 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+         RegCloseKey(key);
+     }
+ 
++    if ((device_set = SetupDiCreateDeviceInfoList(NULL, NULL)))
++    {
++        if (swprintf(device_name, ARRAY_SIZE(device_name), L"SWD\\MMDEVAPI\\{0.0.%u.00000000}.%s", flow, guidstr) != -1)
++        {
++            memset(&device_info_data, 0, sizeof(device_info_data));
++            device_info_data.cbSize = sizeof(device_info_data);
++
++            if (
++                SetupDiCreateDeviceInfoW(device_set, device_name, &AudioEndpoint_ClassGUID, device_name, NULL, 0, &device_info_data) ||
++                (
++                    GetLastError() == ERROR_DEVINST_ALREADY_EXISTS &&
++                    SetupDiOpenDeviceInfoW(device_set, device_name, NULL, 0, &device_info_data)
++                )
++            )
++            {
++                PROPVARIANT pv;
++                PropVariantInit(&pv);
++
++                SetupDiRegisterDeviceInfo(device_set, &device_info_data, 0, NULL, NULL, NULL);
++                if (SUCCEEDED(MMDevice_GetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_ContainerId, &pv)))
++                {
++                    if (pv.vt == VT_CLSID)
++                    {
++                        WCHAR buf[39];
++                        StringFromGUID2(pv.puuid, buf, 39);
++                        if (!SetupDiSetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_BASE_CONTAINERID, (BYTE *)buf, 39 * sizeof(WCHAR)))
++                        {
++                        }
++                    }
++
++                    PropVariantClear(&pv);
++                }
++
++                memset(&device_interface_data, 0, sizeof(device_interface_data));
++                device_interface_data.cbSize = sizeof(device_interface_data);
++
++                if (SetupDiCreateDeviceInterfaceW(device_set, &device_info_data, &DEVINTERFACE_AUDIO_RENDER, NULL, 0, &device_interface_data))
++                {
++                    memset(device_interface_detail, 0, DEVICE_INTERFACE_DETAIL_SIZE);
++                    device_interface_detail->cbSize = sizeof(*device_interface_detail);
++
++                    if (SetupDiGetDeviceInterfaceDetailW(device_set, &device_interface_data, device_interface_detail, DEVICE_INTERFACE_DETAIL_SIZE, NULL, NULL))
++                    {
++                    }
++                }
++            }
++        }
++
++        SetupDiDestroyDeviceInfoList(device_set);
++    }
++
+     if (setdefault)
+     {
+         if (flow == eRender)
+@@ -1296,7 +1360,7 @@ static HRESULT WINAPI MMDevEnum_GetDevice(IMMDeviceEnumerator *iface, const WCHA
+     if(!name || !device)
+         return E_POINTER;
+ 
+-    if(!lstrcmpW(name, L"Wine info device")){
++    if(!lstrcmpiW(name, L"Wine info device")){
+         *device = &info_device;
+         return S_OK;
+     }
+@@ -1313,7 +1377,7 @@ static HRESULT WINAPI MMDevEnum_GetDevice(IMMDeviceEnumerator *iface, const WCHA
+             continue;
+         }
+ 
+-        if (str && !lstrcmpW(str, name))
++        if (str && !lstrcmpiW(str, name))
+         {
+             CoTaskMemFree(str);
+             IMMDevice_AddRef(dev);
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+index f206e65579b..2b5eed117aa 100644
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -66,6 +66,7 @@ static const WCHAR NtPlatformExtension[] = L".NTarm64";
+ /* Registry key names */
+ static const WCHAR ControlClass[] = L"System\\CurrentControlSet\\Control\\Class";
+ static const WCHAR DeviceClasses[] = L"System\\CurrentControlSet\\Control\\DeviceClasses";
++static const WCHAR DeviceContainers[] = L"System\\CurrentControlSet\\Control\\DeviceContainers";
+ static const WCHAR Enum[] = L"System\\CurrentControlSet\\Enum";
+ 
+ #define SERVICE_CONTROL_REENUMERATE_ROOT_DEVICES 128
+@@ -664,7 +665,26 @@ static BOOL SETUPDI_SetDeviceRegistryPropertyW(struct device *device,
+         LONG ret = RegSetValueExW(device->key, PropertyMap[prop].nameW, 0,
+                 PropertyMap[prop].regType, buffer, size);
+         if (!ret)
++        {
++            if (prop == SPDRP_BASE_CONTAINERID)
++            {
++                HKEY keyDevContainer;
++                WCHAR path[MAX_PATH];
++
++                lstrcpyW(path, DeviceContainers);
++                lstrcatW(path, L"\\");
++                lstrcatW(path, (LPCWSTR)buffer);
++                lstrcatW(path, L"\\BaseContainers\\");
++                lstrcatW(path, (LPCWSTR)buffer);
++
++                if (!RegCreateKeyW(HKEY_LOCAL_MACHINE, path, &keyDevContainer))
++                {
++                    RegSetValueExW(keyDevContainer, device->instanceId, 0, REG_NONE, NULL, 0);
++                    RegCloseKey(keyDevContainer);
++                }
++            }
+             return TRUE;
++        }
+ 
+         SetLastError(ret);
+     }
+@@ -2273,6 +2293,14 @@ static void SETUPDI_AddDeviceInterfaces(struct device *device, HKEY key,
+     WCHAR subKeyName[MAX_PATH];
+     LONG l = ERROR_SUCCESS;
+ 
++    /* Hack: treat DEVINTERFACE_AUDIO_RENDER as always present */
++    const GUID DEVINTERFACE_AUDIO_RENDER = {
++        0xe6327cad,
++        0xdcec,
++        0x4949,
++        {0xae, 0x8a, 0x99, 0x1e, 0x97, 0x6a, 0x79, 0xd2}};
++    const BOOL always_present = IsEqualGUID(guid, &DEVINTERFACE_AUDIO_RENDER);
++
+     for (i = 0; !l; i++)
+     {
+         len = ARRAY_SIZE(subKeyName);
+@@ -2291,8 +2319,23 @@ static void SETUPDI_AddDeviceInterfaces(struct device *device, HKEY key,
+                     WCHAR symbolicLink[MAX_PATH];
+                     DWORD dataType;
+ 
+-                    if (!(flags & DIGCF_PRESENT) || is_linked(subKey))
++                    if (!(flags & DIGCF_PRESENT) || always_present || is_linked(subKey))
+                     {
++                        if (always_present)
++                        {
++                            DWORD linked = 1;
++                            HKEY control_key;
++
++                            if (!RegCreateKeyW(subKey, L"Control", &control_key))
++                            {
++                                if (!RegSetValueExW(control_key, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(DWORD)))
++                                {
++                                }
++
++                                RegCloseKey(control_key);
++                            }
++                        }
++
+                         iface = SETUPDI_CreateDeviceInterface(device, guid, subKeyName + 1);
+ 
+                         len = sizeof(symbolicLink);
+@@ -3646,7 +3689,13 @@ BOOL WINAPI SetupDiSetDeviceRegistryPropertyA(HDEVINFO devinfo, SP_DEVINFO_DATA
+                 PropertyMap[Property].regType, PropertyBuffer,
+                 PropertyBufferSize);
+         if (!l)
++        {
++            if (Property == SPDRP_BASE_CONTAINERID)
++            {
++                FIXME("set DeviceContainers same as in SetupDiSetDeviceRegistryPropertyW for SPDRP_BASE_CONTAINERID.");
++            }
+             ret = TRUE;
++        }
+         else
+             SetLastError(l);
+     }
+diff --git a/dlls/xaudio2_7/xaudio_dll.c b/dlls/xaudio2_7/xaudio_dll.c
+index fe9351e8b4a..0cbb8187fa1 100644
+--- a/dlls/xaudio2_7/xaudio_dll.c
++++ b/dlls/xaudio2_7/xaudio_dll.c
+@@ -1778,7 +1778,7 @@ static HRESULT WINAPI IXAudio2Impl_CreateMasteringVoice(IXAudio2 *iface,
+     TRACE("device id %s, category %#x\n", debugstr_w(deviceId), streamCategory);
+ 
+     FAudio_CreateMasteringVoice8(This->faudio, &This->mst.faudio_voice, inputChannels,
+-            inputSampleRate, flags, NULL /* TODO: (uint16_t*)deviceId */,
++            inputSampleRate, flags, (uint16_t*)deviceId,
+             This->mst.effect_chain, (FAudioStreamCategory)streamCategory);
+ #else
+     TRACE("device index %u\n", index);
+diff --git a/libs/faudio/src/FACT.c b/libs/faudio/src/FACT.c
+index 013cea36b5b..243c59e1658 100644
+--- a/libs/faudio/src/FACT.c
++++ b/libs/faudio/src/FACT.c
+@@ -119,6 +119,7 @@ uint32_t FACTAudioEngine_GetRendererDetails(
+ 
+ 	FAudio_PlatformGetDeviceDetails(
+ 		nRendererIndex,
++		NULL,
+ 		&deviceDetails
+ 	);
+ 	FAudio_memcpy(
+diff --git a/libs/faudio/src/FAudio.c b/libs/faudio/src/FAudio.c
+index 47e6b2d02fe..382f06a0512 100644
+--- a/libs/faudio/src/FAudio.c
++++ b/libs/faudio/src/FAudio.c
+@@ -208,18 +208,27 @@ uint32_t FAudio_GetDeviceCount(FAudio *audio, uint32_t *pCount)
+ 	return 0;
+ }
+ 
+-uint32_t FAudio_GetDeviceDetails(
++static uint32_t GetDeviceDetailsImpl(
+ 	FAudio *audio,
+ 	uint32_t Index,
++	const uint16_t *DeviceId,
+ 	FAudioDeviceDetails *pDeviceDetails
+ ) {
+ 	uint32_t result;
+ 	LOG_API_ENTER(audio)
+-	result = FAudio_PlatformGetDeviceDetails(Index, pDeviceDetails);
++	result = FAudio_PlatformGetDeviceDetails(Index, DeviceId, pDeviceDetails);
+ 	LOG_API_EXIT(audio)
+ 	return result;
+ }
+ 
++uint32_t FAudio_GetDeviceDetails(
++	FAudio *audio,
++	uint32_t Index,
++	FAudioDeviceDetails *pDeviceDetails
++) {
++	return GetDeviceDetailsImpl(audio, Index, NULL, pDeviceDetails);
++}
++
+ uint32_t FAudio_Initialize(
+ 	FAudio *audio,
+ 	uint32_t Flags,
+@@ -690,13 +699,14 @@ uint32_t FAudio_CreateSubmixVoice(
+ 	return 0;
+ }
+ 
+-uint32_t FAudio_CreateMasteringVoice(
++static uint32_t CreateMasteringVoiceImpl(
+ 	FAudio *audio,
+ 	FAudioMasteringVoice **ppMasteringVoice,
+ 	uint32_t InputChannels,
+ 	uint32_t InputSampleRate,
+ 	uint32_t Flags,
+ 	uint32_t DeviceIndex,
++	const uint16_t *DeviceId,
+ 	const FAudioEffectChain *pEffectChain
+ ) {
+ 	LOG_API_ENTER(audio)
+@@ -708,7 +718,7 @@ uint32_t FAudio_CreateMasteringVoice(
+ 		InputSampleRate == FAUDIO_DEFAULT_SAMPLERATE	)
+ 	{
+ 		FAudioDeviceDetails details;
+-		if (FAudio_GetDeviceDetails(audio, DeviceIndex, &details) != 0)
++		if (GetDeviceDetailsImpl(audio, DeviceIndex, DeviceId, &details) != 0)
+ 		{
+ 			return FAUDIO_E_INVALID_CALL;
+ 		}
+@@ -765,6 +775,7 @@ uint32_t FAudio_CreateMasteringVoice(
+ 		audio,
+ 		audio->initFlags,
+ 		DeviceIndex,
++		DeviceId,
+ 		&audio->mixFormat,
+ 		&audio->updateSize,
+ 		&audio->platform
+@@ -794,6 +805,34 @@ uint32_t FAudio_CreateMasteringVoice(
+ 	return 0;
+ }
+ 
++uint32_t FAudio_CreateMasteringVoice(
++	FAudio *audio,
++	FAudioMasteringVoice **ppMasteringVoice,
++	uint32_t InputChannels,
++	uint32_t InputSampleRate,
++	uint32_t Flags,
++	uint32_t DeviceIndex,
++	const FAudioEffectChain *pEffectChain
++) {
++	uint32_t retval;
++
++	LOG_API_ENTER(audio)
++
++	retval = CreateMasteringVoiceImpl(
++		audio,
++		ppMasteringVoice,
++		InputChannels,
++		InputSampleRate,
++		Flags,
++		DeviceIndex,
++		NULL,
++		pEffectChain
++	);
++
++	LOG_API_EXIT(audio)
++	return retval;
++}
++
+ uint32_t FAudio_CreateMasteringVoice8(
+ 	FAudio *audio,
+ 	FAudioMasteringVoice **ppMasteringVoice,
+@@ -804,36 +843,19 @@ uint32_t FAudio_CreateMasteringVoice8(
+ 	const FAudioEffectChain *pEffectChain,
+ 	FAudioStreamCategory StreamCategory
+ ) {
+-	uint32_t DeviceIndex, retval;
++	uint32_t retval;
+ 
+ 	LOG_API_ENTER(audio)
+ 
+-	/* Eventually, we'll want the old CreateMastering to call the new one.
+-	 * That will depend on us being able to use DeviceID though.
+-	 * For now, use our little ID hack to turn szDeviceId into DeviceIndex.
+-	 * -flibit
+-	 */
+-	if (szDeviceId == NULL || szDeviceId[0] == 0)
+-	{
+-		DeviceIndex = 0;
+-	}
+-	else
+-	{
+-		DeviceIndex = szDeviceId[0] - L'0';
+-		if (DeviceIndex > FAudio_PlatformGetDeviceCount())
+-		{
+-			DeviceIndex = 0;
+-		}
+-	}
+-
+ 	/* Note that StreamCategory is ignored! */
+-	retval = FAudio_CreateMasteringVoice(
++	retval = CreateMasteringVoiceImpl(
+ 		audio,
+ 		ppMasteringVoice,
+ 		InputChannels,
+ 		InputSampleRate,
+ 		Flags,
+-		DeviceIndex,
++		0,
++		szDeviceId,
+ 		pEffectChain
+ 	);
+ 
+diff --git a/libs/faudio/src/FAudio_internal.h b/libs/faudio/src/FAudio_internal.h
+index 9cbc12cb468..ec8301e1025 100644
+--- a/libs/faudio/src/FAudio_internal.h
++++ b/libs/faudio/src/FAudio_internal.h
+@@ -796,6 +796,7 @@ void FAudio_PlatformInit(
+ 	FAudio *audio,
+ 	uint32_t flags,
+ 	uint32_t deviceIndex,
++	const uint16_t *deviceId,
+ 	FAudioWaveFormatExtensible *mixFormat,
+ 	uint32_t *updateSize,
+ 	void** platformDevice
+@@ -805,6 +806,7 @@ void FAudio_PlatformQuit(void* platformDevice);
+ uint32_t FAudio_PlatformGetDeviceCount(void);
+ uint32_t FAudio_PlatformGetDeviceDetails(
+ 	uint32_t index,
++	const uint16_t *deviceId,
+ 	FAudioDeviceDetails *details
+ );
+ 
+diff --git a/libs/faudio/src/FAudio_platform_win32.c b/libs/faudio/src/FAudio_platform_win32.c
+index 20f15e8fb96..29203803285 100644
+--- a/libs/faudio/src/FAudio_platform_win32.c
++++ b/libs/faudio/src/FAudio_platform_win32.c
+@@ -284,7 +284,7 @@ static HRESULT FAudio_DefaultDeviceIndex(
+  * default device is always at index 0, so we mimick this behavior here by
+  * swapping the devices at indexes 0 and `defaultDeviceIndex`.
+  */
+-static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, IMMDevice **device)
++static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, const uint16_t *deviceId, IMMDevice **device)
+ {
+ 	IMMDeviceCollection *deviceCollection;
+ 	HRESULT hr;
+@@ -293,6 +293,15 @@ static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, IMMDevice **device)
+ 
+ 	*device = NULL;
+ 
++	if (deviceId)
++	{
++		return IMMDeviceEnumerator_GetDevice(
++			device_enumerator,
++			deviceId,
++			device
++		);
++	}
++
+ 	hr = IMMDeviceEnumerator_EnumAudioEndpoints(
+ 		device_enumerator,
+ 		eRender,
+@@ -339,6 +348,7 @@ void FAudio_PlatformInit(
+ 	FAudio *audio,
+ 	uint32_t flags,
+ 	uint32_t deviceIndex,
++	const uint16_t *deviceId,
+ 	FAudioWaveFormatExtensible *mixFormat,
+ 	uint32_t *updateSize,
+ 	void** platformDevice
+@@ -397,7 +407,7 @@ void FAudio_PlatformInit(
+ 	data->stopEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+ 	FAudio_assert(!!data->stopEvent && "Failed to create FAudio thread stop event!");
+ 
+-	hr = FAudio_OpenDevice(deviceIndex, &device);
++	hr = FAudio_OpenDevice(deviceIndex, deviceId, &device);
+ 	FAudio_assert(!FAILED(hr) && "Failed to get audio device!");
+ 
+ 	hr = IMMDevice_Activate(
+@@ -562,6 +572,7 @@ uint32_t FAudio_PlatformGetDeviceCount(void)
+ 
+ uint32_t FAudio_PlatformGetDeviceDetails(
+ 	uint32_t index,
++	const uint16_t *deviceId,
+ 	FAudioDeviceDetails *details
+ ) {
+ 	WAVEFORMATEX *format, *obtained;
+@@ -575,28 +586,73 @@ uint32_t FAudio_PlatformGetDeviceDetails(
+ 	HRESULT hr;
+ 	WCHAR *str;
+ 	GUID sub;
++	WCHAR *default_guid;
+ 
+ 	FAudio_memset(details, 0, sizeof(FAudioDeviceDetails));
+ 
+ 	FAudio_PlatformAddRef();
+ 
+-	count = FAudio_PlatformGetDeviceCount();
+-	if (index >= count)
++	if (deviceId)
+ 	{
+-		FAudio_PlatformRelease();
+-		return FAUDIO_E_INVALID_CALL;
++		/* Open the default device and get its GUID. */
++		hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(
++			device_enumerator,
++			eRender,
++			eConsole,
++			&device
++		);
++		if (FAILED(hr))
++		{
++			FAudio_PlatformRelease();
++			return FAUDIO_E_INVALID_CALL;
++		}
++		hr = IMMDevice_GetId(device, &default_guid);
++		if (FAILED(hr))
++		{
++			IMMDevice_Release(device);
++			FAudio_PlatformRelease();
++			return FAUDIO_E_INVALID_CALL;
++		}
++
++		/* Free the default device. */
++		IMMDevice_Release(device);
++	}
++	else
++	{
++		count = FAudio_PlatformGetDeviceCount();
++		if (index >= count)
++		{
++			FAudio_PlatformRelease();
++			return FAUDIO_E_INVALID_CALL;
++		}
+ 	}
+ 
+-	hr = FAudio_OpenDevice(index, &device);
++	hr = FAudio_OpenDevice(index, deviceId, &device);
+ 	FAudio_assert(!FAILED(hr) && "Failed to get audio endpoint!");
+ 
+-	if (index == 0)
++	if (deviceId)
+ 	{
+-		details->Role = FAudioGlobalDefaultDevice;
++		if (lstrcmpW(default_guid, deviceId) == 0)
++		{
++			details->Role = FAudioGlobalDefaultDevice;
++		}
++		else
++		{
++			details->Role = FAudioNotDefaultDevice;
++		}
++
++		CoTaskMemFree(default_guid);
+ 	}
+ 	else
+ 	{
+-		details->Role = FAudioNotDefaultDevice;
++		if (index == 0)
++		{
++			details->Role = FAudioGlobalDefaultDevice;
++		}
++		else
++		{
++			details->Role = FAudioNotDefaultDevice;
++		}
+ 	}
+ 
+ 	/* Set the Device Display Name */
