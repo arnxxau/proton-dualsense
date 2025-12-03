@@ -1,5 +1,13 @@
 # Proton dualsense
 
+
+update 2:
+
+[xzn](https://github.com/xzn) created his own [repo](https://github.com/xzn/proton-ds5-haptic). Go there for the latest patches and builds!! 
+
+
+
+
 update:
 
 [ClearlyClaire/wine - proton-wine-9.0-1+dualsense](https://github.com/ClearlyClaire/wine/commits/proton-wine-9.0-1%2Bdualsense/) patches are already merged so they are no longer necessary: https://github.com/ValveSoftware/Proton/issues/5900#issuecomment-3447208162
